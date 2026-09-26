@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: enersim-api
+    name: simulations
     runtime: python
     region: frankfurt
     plan: starter
