@@ -1,9 +1,12 @@
 import json
 import math
+import logging
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 from app.db import get_supabase, supabase as _default_client
+
+logger = logging.getLogger("enersim-api.forecast")
 
 _client = _default_client
 
@@ -332,12 +335,6 @@ def _compute_pv_pr_ratio(
 ) -> list[float] | None:
     """
     Compute a per-slot (0-95) performance ratio from historical pairs.
-
-    PR[slot] = weighted mean of (pv_kw / (ghi_wm2 / 1000 * capacity)) for
-    all observations where ghi > threshold in that time-of-day slot.
-    Recent days receive more weight, giving implicit seasonal adaptation.
-    Night slots (no samples above threshold) are zeroed — the GHI gate at
-    forecast time ensures they produce zero output anyway.
     """
     if df_meas.empty or df_weather.empty:
         return None
@@ -346,7 +343,6 @@ def _compute_pv_pr_ratio(
     if "shortwave_radiation_wm2" not in df_weather.columns:
         return None
 
-    # Ensure UTC-aware timestamps
     meas = df_meas[["ts_utc", "pv_kw"]].dropna(subset=["pv_kw"]).copy()
     if meas["ts_utc"].dt.tz is None:
         meas["ts_utc"] = meas["ts_utc"].dt.tz_localize("UTC")
@@ -360,7 +356,6 @@ def _compute_pv_pr_ratio(
     if len(merged) < 96:
         return None
 
-    # Filter: minimum irradiance and non-negative PV output
     merged = merged[
         (merged["ghi"] > PR_GHI_THRESHOLD_WM2) &
         (merged["pv_kw"] >= 0)
@@ -369,24 +364,20 @@ def _compute_pv_pr_ratio(
     if len(merged) < 96:
         return None
 
-    # Raw performance ratio per observation
     merged["pr"] = merged["pv_kw"] / (merged["ghi"] / 1000.0 * pv_capacity_kwp)
     merged = merged[(merged["pr"] >= 0) & (merged["pr"] <= PR_MAX_RATIO)].copy()
 
     if len(merged) < 96:
         return None
 
-    # Recency weight: 1.0 for today, 0.4 for HISTORY_DAYS_TRAIN days ago
     now = datetime.now(timezone.utc)
     merged["days_ago"] = (now - merged["ts_utc"]).dt.total_seconds() / 86400.0
     merged["weight"] = 0.4 + 0.6 * (
         1.0 - merged["days_ago"].clip(0, HISTORY_DAYS_TRAIN) / HISTORY_DAYS_TRAIN
     )
 
-    # Time-of-day slot index (0-95) from UTC timestamp
     merged["slot"] = merged["ts_utc"].dt.hour * 4 + merged["ts_utc"].dt.minute // 15
 
-    # Weighted mean PR per slot
     ratio_96 = np.full(96, np.nan)
     sample_count = np.zeros(96, dtype=int)
 
@@ -398,12 +389,10 @@ def _compute_pv_pr_ratio(
             ratio_96[slot] = float(np.average(pr, weights=w))
             sample_count[slot] = len(slot_data)
 
-    # Require enough valid daytime slots to consider the PR model useful
     valid_mask = np.isfinite(ratio_96)
     if valid_mask.sum() < 12:
         return None
 
-    # Fill sparse slots (dawn/dusk edges) by nearest-neighbor from valid slots
     if not np.all(valid_mask):
         indices = np.arange(96)
         filled = ratio_96.copy()
@@ -414,7 +403,6 @@ def _compute_pv_pr_ratio(
                 filled[i] = ratio_96[nearest]
         ratio_96 = filled
 
-    # Zero out slots that had no above-threshold samples (true night slots)
     ratio_96 = np.where(sample_count > 0, ratio_96, 0.0)
 
     return [_safe_float(v, 0.0) for v in _sanitize_array(ratio_96, 0.0)]
@@ -491,7 +479,6 @@ def train_models_for_site(site_id: str):
     pv_profile = _compute_pv_profile(df)
     ev_profile = _compute_ev_profile(df, site_config)
 
-    # Compute PR ratio model from (historical GHI, measured PV) pairs
     pv_pr_ratio = None
     pr_weather_rows = 0
     if pv_capacity_kwp > 0 and flex_location_id:
@@ -621,13 +608,13 @@ def _apply_temperature_correction(base_forecast: np.ndarray,
 
 # ---------------------------------------------------------------------------
 # Save forecast predictions to DB
+# FIX: uses upsert instead of delete-then-insert (atomic-safe)
 # ---------------------------------------------------------------------------
 
 def _save_forecast(site_id: str, load_fc: np.ndarray, pv_fc: np.ndarray, ev_fc: np.ndarray,
                    lower: np.ndarray, upper: np.ndarray, model_id: str):
     now = datetime.now(timezone.utc)
     start = now.replace(minute=(now.minute // 15) * 15, second=0, microsecond=0)
-    end = start + timedelta(minutes=15 * 95)
 
     rows = []
     for i in range(96):
@@ -657,22 +644,20 @@ def _save_forecast(site_id: str, load_fc: np.ndarray, pv_fc: np.ndarray, ev_fc: 
             }
         })
 
-    def _delete(client):
-        return client.table("forecast_predictions_15m") \
-            .delete() \
-            .eq("site_id", site_id) \
-            .gte("ts_utc", start.isoformat()) \
-            .lte("ts_utc", end.isoformat()) \
-            .execute()
+    def _upsert(client):
+        return client.table("forecast_predictions_15m").upsert(
+            rows,
+            on_conflict="site_id,ts_utc,model_id"
+        ).execute()
 
-    def _insert(client):
-        return client.table("forecast_predictions_15m").insert(rows).execute()
-
-    _with_retry(_delete)
-    _with_retry(_insert)
+    try:
+        _with_retry(_upsert)
+    except Exception as e:
+        logger.error("Failed to upsert forecast predictions: %s", e)
+        raise
 
 # ---------------------------------------------------------------------------
-# Lightweight inline training fallback (7 days only)
+# Lightweight inline training fallback (30 days, not 7)
 # ---------------------------------------------------------------------------
 
 def _inline_train_fallback(site_id: str) -> dict | None:
@@ -706,13 +691,12 @@ def run_forecast_for_site(site_id: str):
     now = datetime.now(timezone.utc)
     horizon_end = now + timedelta(hours=25)
 
-    # Try pre-computed model (fast path)
     params = _load_model_params(site_id)
     data_source = "cached_model"
 
     if params is None:
         params = _inline_train_fallback(site_id)
-        data_source = "inline_fallback_7d"
+        data_source = "inline_fallback_30d"
         if params is None:
             return {"error": "geen meetdata gevonden", "site_id": site_id}
 
@@ -727,7 +711,6 @@ def run_forecast_for_site(site_id: str):
     pv_capacity_kwp = site_config.get("pv_capacity_kwp", 0.0)
     config_available = pv_capacity_kwp > 0
 
-    # Fetch 15-minute forecast weather (primary source: flex_weather_15m)
     weather_15m_fc = pd.DataFrame()
     if flex_location_id:
         raw_15m = _fetch_weather_15m(flex_location_id, now - timedelta(minutes=15), horizon_end)
@@ -736,21 +719,13 @@ def run_forecast_for_site(site_id: str):
                 raw_15m["ts_utc"] >= pd.Timestamp(now, tz="UTC")
             ].reset_index(drop=True)
 
-    # Hourly forecast from separate table (used for physics fallback + temperature)
     weather_fc = _fetch_weather_forecast(site_id, now - timedelta(hours=1), horizon_end)
 
-    # Temperature correction on load profile
     if not weather_fc.empty:
         load_fc = _apply_temperature_correction(load_fc, weather_fc)
     elif not weather_15m_fc.empty:
         load_fc = _apply_temperature_correction(load_fc, weather_15m_fc)
 
-    # -----------------------------------------------------------------------
-    # PV forecast — priority order:
-    #   1. Learned PR ratio x forecast GHI  (weather-aware, site-calibrated)
-    #   2. Historical average PV profile    (ignores weather)
-    #   3. Physics model x forecast GHI    (generic model)
-    # -----------------------------------------------------------------------
     pv_source = "none"
     pv_fc = np.zeros(96)
     start = now.replace(minute=(now.minute // 15) * 15, second=0, microsecond=0)
@@ -799,23 +774,18 @@ def run_forecast_for_site(site_id: str):
     else:
         pv_source = "no_pv_config" if not config_available else "none"
 
-    # Confidence bounds
     lower = _sanitize_array(load_fc - load_std)
     upper = _sanitize_array(load_fc + load_std)
 
-    # Final sanitize
     load_fc = _sanitize_array(load_fc)
     pv_fc = _sanitize_array(pv_fc)
     ev_fc = _sanitize_array(ev_fc)
 
-    # Roll time-of-day profiles so index 0 aligns with forecast start time.
-    # PR-weather PV is built per-timestep so it is already time-aligned.
     start_slot = start.hour * 4 + start.minute // 15
     load_fc = np.roll(load_fc, -start_slot)
     ev_fc = np.roll(ev_fc, -start_slot)
     lower = np.roll(lower, -start_slot)
     upper = np.roll(upper, -start_slot)
-    # "measured" was already rolled during construction above; skip it here.
 
     _save_forecast(site_id, load_fc, pv_fc, ev_fc, lower, upper, MODEL_ID)
 
