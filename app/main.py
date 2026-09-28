@@ -1,8 +1,10 @@
 import logging
+import os
 import traceback
 import pandas as pd
 import requests as http_requests
-from fastapi import FastAPI
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -19,7 +21,30 @@ from app.services.optimizer_service import run_optimizer_for_site
 from app.services.pypsa_optimizer import StandaloneOptimizeRequest, run_standalone_optimize
 from datetime import datetime, timedelta, timezone
 
-app = FastAPI(title="EnerSim API")
+logger = logging.getLogger("enersim-api")
+logging.basicConfig(level=logging.INFO)
+
+API_KEY = os.environ.get("ENERSIM_API_KEY", "")
+
+def _verify_api_key(x_api_key: str | None = Header(default=None)):
+    """Reject requests without the correct API key."""
+    if not API_KEY:
+        return  # If no key is configured, allow all (dev mode)
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Prime the Supabase connection on startup
+    try:
+        client = get_supabase()
+        client.table("forecast_sites").select("id").limit(1).execute()
+        logger.info("Supabase connection primed successfully")
+    except Exception as e:
+        logger.warning("Could not prime Supabase connection: %s", e)
+    yield
+
+app = FastAPI(title="EnerSim API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,14 +57,6 @@ app.add_middleware(
 class SiteRequest(BaseModel):
     site_id: str
     target_date: str | None = None
-
-@app.on_event("startup")
-def prime_supabase_connection():
-    try:
-        client = get_supabase()
-        client.table("forecast_sites").select("id").limit(1).execute()
-    except Exception:
-        pass
 
 @app.get("/")
 def root():
@@ -62,7 +79,7 @@ def version():
         "pypsa": pypsa.__version__,
         "linopy": linopy.__version__,
         "highspy": hs_ver,
-        "optimizer_code": "2026-09-27",
+        "optimizer_code": "2026-09-28",
     }
 
 @app.options("/{full_path:path}")
@@ -70,43 +87,43 @@ def preflight_handler(full_path: str):
     return {"ok": True}
 
 @app.post("/train")
-def train(req: SiteRequest):
+def train(req: SiteRequest, api_key: str = Depends(_verify_api_key)):
     try:
         return train_models_for_site(req.site_id)
     except Exception as e:
-        logging.error("/train failed: %s\n%s", e, traceback.format_exc())
+        logger.error("/train failed: %s\n%s", e, traceback.format_exc())
         return JSONResponse(
             status_code=500,
             content={"error": str(e), "site_id": req.site_id}
         )
 
 @app.post("/forecast")
-def forecast(req: SiteRequest):
+def forecast(req: SiteRequest, api_key: str = Depends(_verify_api_key)):
     try:
         result = run_forecast_for_site(req.site_id)
         if "error" in result:
             return JSONResponse(status_code=422, content=result)
         return result
     except Exception as e:
-        logging.error("/forecast failed for site %s: %s\n%s", req.site_id, e, traceback.format_exc())
+        logger.error("/forecast failed for site %s: %s\n%s", req.site_id, e, traceback.format_exc())
         return JSONResponse(
             status_code=500,
             content={"error": str(e), "site_id": req.site_id}
         )
 
 @app.post("/optimize")
-def optimize(req: SiteRequest):
+def optimize(req: SiteRequest, api_key: str = Depends(_verify_api_key)):
     try:
         return run_optimizer_for_site(req.site_id, target_date=req.target_date)
     except Exception as e:
-        logging.error("/optimize failed for site %s: %s\n%s", req.site_id, e, traceback.format_exc())
+        logger.error("/optimize failed for site %s: %s\n%s", req.site_id, e, traceback.format_exc())
         return JSONResponse(
             status_code=500,
             content={"error": str(e), "site_id": req.site_id}
         )
 
 @app.post("/forecast-and-optimize")
-def forecast_and_optimize(req: SiteRequest):
+def forecast_and_optimize(req: SiteRequest, api_key: str = Depends(_verify_api_key)):
     try:
         fc = run_forecast_for_site(req.site_id)
         if "error" in fc:
@@ -118,31 +135,25 @@ def forecast_and_optimize(req: SiteRequest):
             "optimization": opt
         }
     except Exception as e:
-        logging.error("/forecast-and-optimize failed for site %s: %s\n%s", req.site_id, e, traceback.format_exc())
+        logger.error("/forecast-and-optimize failed for site %s: %s\n%s", req.site_id, e, traceback.format_exc())
         return JSONResponse(
             status_code=500,
             content={"error": str(e), "site_id": req.site_id}
         )
 
 @app.post("/standalone-optimize")
-def standalone_optimize(req: StandaloneOptimizeRequest):
+def standalone_optimize(req: StandaloneOptimizeRequest, api_key: str = Depends(_verify_api_key)):
     try:
         return run_standalone_optimize(req)
     except Exception as e:
-        logging.error("/standalone-optimize failed for date %s: %s\n%s", getattr(req, 'date', '?'), e, traceback.format_exc())
+        logger.error("/standalone-optimize failed for date %s: %s\n%s", getattr(req, 'date', '?'), e, traceback.format_exc())
         return JSONResponse(
             status_code=500,
             content={"error": str(e), "date": getattr(req, 'date', None)}
         )
 
 @app.post("/backfill-weather")
-def backfill_weather(req: SiteRequest):
-    """
-    Backfill up to 60 days of historical 15-minute weather data from the
-    Open-Meteo Archive API into flex_weather_15m. Run once per site after
-    deployment to ensure the PR-ratio model has enough training data.
-    Existing rows are never overwritten (ignoreDuplicates=True).
-    """
+def backfill_weather(req: SiteRequest, api_key: str = Depends(_verify_api_key)):
     try:
         supabase = get_supabase()
 
@@ -205,7 +216,6 @@ def backfill_weather(req: SiteRequest):
                 "updated_at": updated_at,
             })
 
-        # Insert in batches of 500 to avoid request size limits
         inserted = 0
         batch_size = 500
         for offset in range(0, len(rows), batch_size):
@@ -233,7 +243,7 @@ def backfill_weather(req: SiteRequest):
         )
 
 @app.get("/status/{site_id}")
-def site_status(site_id: str):
+def site_status(site_id: str, api_key: str = Depends(_verify_api_key)):
     """Check what data and config is available for a site."""
     try:
         now = datetime.now(timezone.utc)
