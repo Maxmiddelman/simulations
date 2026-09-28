@@ -3,7 +3,7 @@ PyPSA-based battery dispatch optimizer for standalone trade calculations.
 
 Uses linear programming via PyPSA + HiGHS to find the globally optimal
 battery charge/discharge schedule that minimizes net energy cost (or
-maximizes revenue) over a 96-slot (24h, 15-min) horizon
+maximizes revenue) over a 96-slot (24h, 15-min) horizon.
 
 Optimizes the full day in a single LP solve — no rolling 4h windows.
 Degradation and SOC target are integrated into the LP objective.
@@ -14,7 +14,7 @@ import math
 import numpy as np
 import pandas as pd
 from typing import Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 class StandaloneOptimizeRequest(BaseModel):
     """Input schema matching the existing DayOptimizerRequest from the edge function."""
@@ -47,6 +47,34 @@ class StandaloneOptimizeRequest(BaseModel):
     handel_cost_eur_per_mwh: float = 0.0
     clearing_cost_eur_per_mwh: float = 0.0
     target_soc_kwh: Optional[float] = None
+
+    @field_validator("pv_kwh_96", "da_price_eur_per_mwh_96")
+    @classmethod
+    def validate_96_elements(cls, v):
+        if len(v) != 96:
+            raise ValueError(f"Array must have exactly 96 elements, got {len(v)}")
+        return v
+
+    @field_validator("id_price_eur_per_mwh_96", "load_kwh_96")
+    @classmethod
+    def validate_96_optional(cls, v):
+        if v is not None and len(v) != 96:
+            raise ValueError(f"Array must have exactly 96 elements, got {len(v)}")
+        return v
+
+    @field_validator("battery_power_kw")
+    @classmethod
+    def validate_power_positive(cls, v):
+        if v <= 0:
+            raise ValueError("battery_power_kw must be > 0")
+        return v
+
+    @field_validator("battery_capacity_kwh")
+    @classmethod
+    def validate_capacity_positive(cls, v):
+        if v <= 0:
+            raise ValueError("battery_capacity_kwh must be > 0")
+        return v
 
 def _build_pypsa_network(req: StandaloneOptimizeRequest):
     import pypsa
@@ -141,10 +169,6 @@ def _build_pypsa_network(req: StandaloneOptimizeRequest):
 
     shifted_initial = max(0, req.initial_soc_kwh - min_soc)
 
-    # Degradation cost: add as marginal_cost on the storage unit so the LP
-    # naturally penalizes throughput instead of post-processing.
-    # PyPSA applies marginal_cost to dispatch power (kW), so per-kWh cost
-    # is degradation_cost / dt_hours to get EUR/kW equivalent.
     degradation_marginal = req.degradation_cost_eur_per_kwh / dt_hours
 
     use_cyclic = req.target_soc_kwh is not None
@@ -164,17 +188,11 @@ def _build_pypsa_network(req: StandaloneOptimizeRequest):
     )
 
     # --- SOC target constraint ---
-    # If target_soc_kwh is set, add a constraint that the final SOC must
-    # be >= target (shifted into usable-band coordinates).
     if req.target_soc_kwh is not None:
         shifted_target = max(0, req.target_soc_kwh - min_soc)
         if use_cyclic:
-            # With cyclic=True, PyPSA enforces soc[-1] == soc[0] automatically.
-            # We set state_of_charge_initial to the shifted target so the
-            # battery starts and ends at the target.
             network.storage_units.loc["battery", "state_of_charge_initial"] = shifted_target
         else:
-            # Without cyclic, add an explicit constraint on the last snapshot.
             try:
                 model = network.optimize.create_model(solver_name="highs")
                 soc = model.variables["StorageUnit-state_of_charge"]
@@ -184,22 +202,34 @@ def _build_pypsa_network(req: StandaloneOptimizeRequest):
                     name="soc_target_final",
                 )
             except Exception:
-                pass  # Fallback: if custom constraint fails, proceed without it
+                pass
 
     return network, min_soc, max_soc, usable_band
 
 def run_standalone_optimize(req: StandaloneOptimizeRequest) -> dict:
     """
     Run PyPSA LP optimization for a single day (96 slots).
-
     Returns a dict matching the existing edge function response format.
     """
     n_slots = 96
     dt_hours = 0.25
 
+    # Early validation — prevents cryptic PyPSA errors
+    if req.battery_power_kw <= 0:
+        return {
+            "success": False,
+            "error": "battery_power_kw must be > 0",
+            "status": "invalid_input",
+        }
+    if req.battery_capacity_kwh <= 0:
+        return {
+            "success": False,
+            "error": "battery_capacity_kwh must be > 0",
+            "status": "invalid_input",
+        }
+
     network, min_soc, max_soc, usable_band = _build_pypsa_network(req)
 
-    # Solve with HiGHS LP
     try:
         network.optimize(solver_name="highs")
     except Exception as exc:
