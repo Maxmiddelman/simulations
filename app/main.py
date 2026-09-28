@@ -4,7 +4,7 @@ import traceback
 import pandas as pd
 import requests as http_requests
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
