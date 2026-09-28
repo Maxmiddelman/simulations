@@ -1,3 +1,5 @@
+import logging
+import traceback
 import pandas as pd
 import requests as http_requests
 from fastapi import FastAPI
@@ -39,9 +41,29 @@ def prime_supabase_connection():
     except Exception:
         pass
 
+@app.get("/")
+def root():
+    return {"service": "simulations", "status": "ok"}
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+@app.get("/version")
+def version():
+    import pypsa, linopy
+    try:
+        import highspy as hs
+        hs_ver = hs.__version__
+    except Exception:
+        hs_ver = "unknown"
+    return {
+        "service": "simulations",
+        "pypsa": pypsa.__version__,
+        "linopy": linopy.__version__,
+        "highspy": hs_ver,
+        "optimizer_code": "2026-09-27",
+    }
 
 @app.options("/{full_path:path}")
 def preflight_handler(full_path: str):
@@ -52,6 +74,7 @@ def train(req: SiteRequest):
     try:
         return train_models_for_site(req.site_id)
     except Exception as e:
+        logging.error("/train failed: %s\n%s", e, traceback.format_exc())
         return JSONResponse(
             status_code=500,
             content={"error": str(e), "site_id": req.site_id}
@@ -65,6 +88,7 @@ def forecast(req: SiteRequest):
             return JSONResponse(status_code=422, content=result)
         return result
     except Exception as e:
+        logging.error("/forecast failed for site %s: %s\n%s", req.site_id, e, traceback.format_exc())
         return JSONResponse(
             status_code=500,
             content={"error": str(e), "site_id": req.site_id}
@@ -75,6 +99,7 @@ def optimize(req: SiteRequest):
     try:
         return run_optimizer_for_site(req.site_id, target_date=req.target_date)
     except Exception as e:
+        logging.error("/optimize failed for site %s: %s\n%s", req.site_id, e, traceback.format_exc())
         return JSONResponse(
             status_code=500,
             content={"error": str(e), "site_id": req.site_id}
@@ -93,6 +118,7 @@ def forecast_and_optimize(req: SiteRequest):
             "optimization": opt
         }
     except Exception as e:
+        logging.error("/forecast-and-optimize failed for site %s: %s\n%s", req.site_id, e, traceback.format_exc())
         return JSONResponse(
             status_code=500,
             content={"error": str(e), "site_id": req.site_id}
@@ -103,9 +129,10 @@ def standalone_optimize(req: StandaloneOptimizeRequest):
     try:
         return run_standalone_optimize(req)
     except Exception as e:
+        logging.error("/standalone-optimize failed for date %s: %s\n%s", getattr(req, 'date', '?'), e, traceback.format_exc())
         return JSONResponse(
             status_code=500,
-            content={"error": str(e), "date": req.date}
+            content={"error": str(e), "date": getattr(req, 'date', None)}
         )
 
 @app.post("/backfill-weather")
@@ -178,6 +205,7 @@ def backfill_weather(req: SiteRequest):
                 "updated_at": updated_at,
             })
 
+        # Insert in batches of 500 to avoid request size limits
         inserted = 0
         batch_size = 500
         for offset in range(0, len(rows), batch_size):
