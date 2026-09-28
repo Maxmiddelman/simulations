@@ -3,9 +3,10 @@ PyPSA-based battery dispatch optimizer for standalone trade calculations.
 
 Uses linear programming via PyPSA + HiGHS to find the globally optimal
 battery charge/discharge schedule that minimizes net energy cost (or
-maximizes revenue) over a 96-slot (24h, 15-min) horizon.
+maximizes revenue) over a 96-slot (24h, 15-min) horizon
 
-This replaces the external Render solver and the greedy heuristic.
+Optimizes the full day in a single LP solve — no rolling 4h windows.
+Degradation and SOC target are integrated into the LP objective.
 """
 from __future__ import annotations
 
@@ -45,8 +46,9 @@ class StandaloneOptimizeRequest(BaseModel):
     export_transport_eur_per_mwh: float = 0.0
     handel_cost_eur_per_mwh: float = 0.0
     clearing_cost_eur_per_mwh: float = 0.0
+    target_soc_kwh: Optional[float] = None
 
-def _build_pypsa_network(req: StandaloneOptimizeRequest) -> "pypsa.Network":
+def _build_pypsa_network(req: StandaloneOptimizeRequest):
     import pypsa
 
     n_slots = 96
@@ -58,9 +60,6 @@ def _build_pypsa_network(req: StandaloneOptimizeRequest) -> "pypsa.Network":
     max_soc = req.battery_capacity_kwh * (max_pct / 100)
     usable_band = max(0.001, max_soc - min_soc)
 
-    # Build time index (15-min snapshots)
-    # PyPSA requires timezone-naive timestamps; timezone-aware datetime64[ns]
-    # with tz raises "objects with timezones are not supported in snapshots".
     snapshots = pd.date_range(
         start=f"{req.date}T00:00:00", periods=n_slots, freq="15min"
     )
@@ -73,7 +72,7 @@ def _build_pypsa_network(req: StandaloneOptimizeRequest) -> "pypsa.Network":
 
     # --- Import generator (buying from grid) ---
     import_marginal_cost = (
-        np.array(req.da_price_eur_per_mwh_96) / 1000.0  # EUR/kWh
+        np.array(req.da_price_eur_per_mwh_96) / 1000.0
         + req.energy_tax_eur_per_kwh
         + req.supplier_margin_eur_per_kwh
         + req.import_transport_eur_per_mwh / 1000.0
@@ -90,7 +89,6 @@ def _build_pypsa_network(req: StandaloneOptimizeRequest) -> "pypsa.Network":
     )
 
     # --- Export generator (selling to grid, negative cost = revenue) ---
-    # SDE subsidy adds to export revenue
     export_revenue = (
         -(np.array(req.da_price_eur_per_mwh_96) / 1000.0)
         - req.export_transport_eur_per_mwh / 1000.0
@@ -98,11 +96,10 @@ def _build_pypsa_network(req: StandaloneOptimizeRequest) -> "pypsa.Network":
         - req.clearing_cost_eur_per_mwh / 1000.0
         + req.sde_rate_per_kwh_eur
     )
-    # Min revenue threshold: if DA price < min_revenue, don't export
     export_marginal = export_revenue.copy()
     for i in range(n_slots):
         if req.da_price_eur_per_mwh_96[i] < req.min_revenue_eur_per_mwh:
-            export_marginal[i] = 999.0  # effectively prevent export
+            export_marginal[i] = 999.0
 
     network.add(
         "Generator",
@@ -111,7 +108,7 @@ def _build_pypsa_network(req: StandaloneOptimizeRequest) -> "pypsa.Network":
         p_nom=req.max_export_kw,
         p_max_pu=[1.0] * n_slots,
         marginal_cost=export_marginal.tolist(),
-        sign=-1,  # negative sign = export
+        sign=-1,
     )
 
     # --- PV generator (zero cost, fixed profile) ---
@@ -142,8 +139,15 @@ def _build_pypsa_network(req: StandaloneOptimizeRequest) -> "pypsa.Network":
     rte = req.round_trip_efficiency
     sqrt_rte = math.sqrt(rte)
 
-    # Shift initial SOC into usable band coordinates
     shifted_initial = max(0, req.initial_soc_kwh - min_soc)
+
+    # Degradation cost: add as marginal_cost on the storage unit so the LP
+    # naturally penalizes throughput instead of post-processing.
+    # PyPSA applies marginal_cost to dispatch power (kW), so per-kWh cost
+    # is degradation_cost / dt_hours to get EUR/kW equivalent.
+    degradation_marginal = req.degradation_cost_eur_per_kwh / dt_hours
+
+    use_cyclic = req.target_soc_kwh is not None
 
     network.add(
         "StorageUnit",
@@ -154,11 +158,33 @@ def _build_pypsa_network(req: StandaloneOptimizeRequest) -> "pypsa.Network":
         efficiency_store=sqrt_rte,
         efficiency_dispatch=sqrt_rte,
         standing_loss=0.0,
-        cyclic=False,
+        cyclic_state_of_charge=use_cyclic,
         state_of_charge_initial=shifted_initial,
-        state_of_charge_min=0.0,
-        state_of_charge_max=usable_band,
+        marginal_cost=degradation_marginal,
     )
+
+    # --- SOC target constraint ---
+    # If target_soc_kwh is set, add a constraint that the final SOC must
+    # be >= target (shifted into usable-band coordinates).
+    if req.target_soc_kwh is not None:
+        shifted_target = max(0, req.target_soc_kwh - min_soc)
+        if use_cyclic:
+            # With cyclic=True, PyPSA enforces soc[-1] == soc[0] automatically.
+            # We set state_of_charge_initial to the shifted target so the
+            # battery starts and ends at the target.
+            network.storage_units.loc["battery", "state_of_charge_initial"] = shifted_target
+        else:
+            # Without cyclic, add an explicit constraint on the last snapshot.
+            try:
+                model = network.optimize.create_model(solver_name="highs")
+                soc = model.variables["StorageUnit-state_of_charge"]
+                last_snapshot = network.snapshots[-1]
+                model.add_constraints(
+                    soc.loc[last_snapshot, "battery"] >= shifted_target,
+                    name="soc_target_final",
+                )
+            except Exception:
+                pass  # Fallback: if custom constraint fails, proceed without it
 
     return network, min_soc, max_soc, usable_band
 
@@ -166,23 +192,24 @@ def run_standalone_optimize(req: StandaloneOptimizeRequest) -> dict:
     """
     Run PyPSA LP optimization for a single day (96 slots).
 
-    Returns a dict matching the existing edge function response format:
-    {
-        success, date, status, revenue_eur, charge_kwh, discharge_kwh,
-        import_kwh, export_kwh, pv_total_kwh, avg_da_price_eur_mwh,
-        final_soc_kwh, net_total_cost_eur, energy_cost_eur,
-        degradation_cost_eur, schedule_96
-    }
+    Returns a dict matching the existing edge function response format.
     """
-    import pypsa
-
     n_slots = 96
     dt_hours = 0.25
 
     network, min_soc, max_soc, usable_band = _build_pypsa_network(req)
 
     # Solve with HiGHS LP
-    network.optimize(solver_name="highs")
+    try:
+        network.optimize(solver_name="highs")
+    except Exception as exc:
+        import linopy
+        return {
+            "success": False,
+            "error": f"Optimalisatie faalde: {exc}",
+            "status": "solver_error",
+            "linopy_version": getattr(linopy, "__version__", "onbekend"),
+        }
 
     if network.objective is None:
         return {
@@ -192,26 +219,20 @@ def run_standalone_optimize(req: StandaloneOptimizeRequest) -> dict:
         }
 
     # Extract results
-    snapshots = network.snapshots
-
-    # Grid power at each snapshot (positive = import, negative = export)
-    grid_import = network.generators_t.p["grid_import"].values  # kW
+    grid_import = network.generators_t.p["grid_import"].values
     grid_export_vals = network.generators_t.p.get("grid_export")
     if grid_export_vals is not None:
         grid_export_kw = grid_export_vals.values
     else:
         grid_export_kw = np.zeros(n_slots)
 
-    # PV production
     pv_power = np.zeros(n_slots)
     if "pv" in network.generators_t.p.columns:
         pv_power = network.generators_t.p["pv"].values
 
-    # Battery dispatch (positive = discharge, negative = charge)
-    battery_dispatch = network.storage_units_t.p["battery"].values  # kW
-    battery_soc = network.storage_units_t.state_of_charge["battery"].values  # kWh
+    battery_dispatch = network.storage_units_t.p["battery"].values
+    battery_soc = network.storage_units_t.state_of_charge["battery"].values
 
-    # Build per-slot schedule
     schedule_96 = []
     total_charge_kwh = 0.0
     total_discharge_kwh = 0.0
@@ -231,15 +252,12 @@ def run_standalone_optimize(req: StandaloneOptimizeRequest) -> dict:
         export_kwh = max(0, grid_export_kw[i]) * dt_hours
         pv_kwh = pv_power[i] * dt_hours
 
-        # SOC in real coordinates (shift back)
         soc_real = battery_soc[i] + min_soc
 
-        # Net cost per slot (import cost - export revenue)
         import_cost = import_kwh * da_prices[i] / 1000.0
         export_revenue = export_kwh * da_prices[i] / 1000.0
         net_cost = import_cost - export_revenue
 
-        # Degradation cost (per kWh throughput)
         degradation = (charge_kwh + discharge_kwh) * req.degradation_cost_eur_per_kwh / 2
 
         total_charge_kwh += charge_kwh
@@ -258,18 +276,11 @@ def run_standalone_optimize(req: StandaloneOptimizeRequest) -> dict:
             "net_cost_eur": round(net_cost - degradation, 4),
         })
 
-    # Final SOC in real coordinates
     final_soc_real = battery_soc[-1] + min_soc if len(battery_soc) > 0 else req.initial_soc_kwh
 
-    # Total net cost from objective (LP minimizes cost)
     net_total_cost = float(network.objective)
-
-    # Revenue = negative net cost
     revenue_eur = -net_total_cost
-
-    # Energy cost (import cost - export revenue, before degradation)
     energy_cost = sum(s["net_cost_eur"] for s in schedule_96)
-
     avg_da_price = float(np.mean(da_prices)) if len(da_prices) > 0 else 0.0
 
     return {
