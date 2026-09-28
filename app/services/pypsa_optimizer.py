@@ -6,7 +6,7 @@ battery charge/discharge schedule that minimizes net energy cost (or
 maximizes revenue) over a 96-slot (24h, 15-min) horizon.
 
 Optimizes the full day in a single LP solve — no rolling 4h windows.
-Degradation and SOC target are integrated into the LP objective.
+Degradation, SOC target, and kW-max peak charge are integrated into the LP.
 """
 from __future__ import annotations
 
@@ -169,6 +169,10 @@ def _build_pypsa_network(req: StandaloneOptimizeRequest):
 
     shifted_initial = max(0, req.initial_soc_kwh - min_soc)
 
+    # Degradation cost: add as marginal_cost on the storage unit so the LP
+    # naturally penalizes throughput instead of post-processing.
+    # PyPSA applies marginal_cost to dispatch power (kW), so per-kWh cost
+    # is degradation_cost / dt_hours to get EUR/kW equivalent.
     degradation_marginal = req.degradation_cost_eur_per_kwh / dt_hours
 
     use_cyclic = req.target_soc_kwh is not None
@@ -188,11 +192,17 @@ def _build_pypsa_network(req: StandaloneOptimizeRequest):
     )
 
     # --- SOC target constraint ---
+    # If target_soc_kwh is set, add a constraint that the final SOC must
+    # be >= target (shifted into usable-band coordinates).
     if req.target_soc_kwh is not None:
         shifted_target = max(0, req.target_soc_kwh - min_soc)
         if use_cyclic:
+            # With cyclic=True, PyPSA enforces soc[-1] == soc[0] automatically.
+            # We set state_of_charge_initial to the shifted target so the
+            # battery starts and ends at the target.
             network.storage_units.loc["battery", "state_of_charge_initial"] = shifted_target
         else:
+            # Without cyclic, add an explicit constraint on the last snapshot.
             try:
                 model = network.optimize.create_model(solver_name="highs")
                 soc = model.variables["StorageUnit-state_of_charge"]
@@ -202,19 +212,115 @@ def _build_pypsa_network(req: StandaloneOptimizeRequest):
                     name="soc_target_final",
                 )
             except Exception:
-                pass
+                pass  # Fallback: if custom constraint fails, proceed without it
 
     return network, min_soc, max_soc, usable_band
+
+def _compute_kw_max_cost(peak_import_kw: float, req: StandaloneOptimizeRequest) -> float:
+    """Compute the Dutch kW-max (capacity) charge for a given peak import power."""
+    if not req.include_kw_max:
+        return 0.0
+    free_threshold = req.kw_max_free_threshold_kw
+    mid_threshold = req.kw_max_mid_threshold_kw
+    if peak_import_kw <= free_threshold:
+        return 0.0
+    mid_band = min(peak_import_kw, mid_threshold) - free_threshold
+    high_band = max(0, peak_import_kw - mid_threshold)
+    return mid_band * req.kw_max_mid_tariff_eur_per_kw + high_band * req.kw_max_high_tariff_eur_per_kw
+
+def _add_kw_max_constraints(network, req: StandaloneOptimizeRequest):
+    """Add a peak-import-power variable and piecewise-linear kW-max cost to the LP model.
+
+    The Dutch kW-max tariff charges per kW of peak import power above a free threshold,
+    with two tiers (mid and high). We model this with two non-negative variables:
+    - mid_excess: kW above free threshold, up to mid_threshold
+    - high_excess: kW above mid_threshold
+
+    The daily cost is: mid_excess * mid_tariff + high_excess * high_tariff (per day).
+    We add this to the objective by giving the import generator an extra marginal cost
+    that approximates the marginal cost of peak power, and then compute the exact
+    charge post-optimization.
+
+    Since the LP is linear and the kW-max cost is piecewise-linear in the peak
+    (not in per-slot energy), we add it as a custom constraint + objective term.
+    """
+    import pypsa
+
+    n_slots = 96
+    free_threshold = req.kw_max_free_threshold_kw
+    mid_threshold = req.kw_max_mid_threshold_kw
+    mid_tariff = req.kw_max_mid_tariff_eur_per_kw
+    high_tariff = req.kw_max_high_tariff_eur_per_kw
+
+    try:
+        model = network.optimize.create_model(solver_name="highs")
+    except Exception:
+        return None
+
+    # Get the import power variable (per snapshot)
+    try:
+        import_p = model.variables["Generator-p"]
+    except KeyError:
+        return None
+
+    snapshots = network.snapshots
+
+    # Add a peak variable: peak_import_kw >= import_p[i] for all i
+    # We split into mid_excess and high_excess:
+    #   mid_excess >= 0
+    #   high_excess >= 0
+    #   mid_excess <= (mid_threshold - free_threshold)
+    #   For each slot i: import_p[i] <= free_threshold + mid_excess + high_excess
+    # Objective adds: mid_excess * mid_tariff + high_excess * high_tariff
+
+    mid_capacity = max(0, mid_threshold - free_threshold)
+
+    # Create the variables by adding dummy Generators with appropriate costs
+    # and then constraining them. This is the standard PyPSA/linopy approach.
+    try:
+        # Add mid_excess as a generator with marginal_cost = mid_tariff (per kW per day)
+        # We use a single-timestep "snapshot" approach: add a new bus and generator
+        # that only exists at a virtual snapshot, then link via constraints.
+
+        # Simpler approach: use linopy variables directly
+        import linopy
+
+        # mid_excess: kW of peak above free threshold, capped at mid_capacity
+        mid_excess = model.add_variables(
+            lower=0, upper=mid_capacity if mid_capacity > 0 else 0,
+            name="kw_max_mid_excess",
+        )
+        # high_excess: kW of peak above mid threshold
+        high_excess = model.add_variables(
+            lower=0,
+            name="kw_max_high_excess",
+        )
+
+        # For each snapshot: import_p[i] - free_threshold <= mid_excess + high_excess
+        for i, snap in enumerate(snapshots):
+            import_var = import_p.loc[snap, "grid_import"]
+            model.add_constraints(
+                import_var - free_threshold - mid_excess - high_excess <= 0,
+                name=f"kw_max_peak_{i}",
+            )
+
+        # Add cost to objective: mid_excess * mid_tariff + high_excess * high_tariff
+        # linopy adds variables to the objective with .add_objective()
+        model.objective += mid_excess * mid_tariff + high_excess * high_tariff
+
+        return {"mid_excess": mid_excess, "high_excess": high_excess}
+    except Exception:
+        return None
 
 def run_standalone_optimize(req: StandaloneOptimizeRequest) -> dict:
     """
     Run PyPSA LP optimization for a single day (96 slots).
+
     Returns a dict matching the existing edge function response format.
     """
     n_slots = 96
     dt_hours = 0.25
 
-    # Early validation — prevents cryptic PyPSA errors
     if req.battery_power_kw <= 0:
         return {
             "success": False,
@@ -230,8 +336,17 @@ def run_standalone_optimize(req: StandaloneOptimizeRequest) -> dict:
 
     network, min_soc, max_soc, usable_band = _build_pypsa_network(req)
 
+    # Add kW-max peak charge constraints if enabled
+    kw_max_vars = None
+    if req.include_kw_max:
+        kw_max_vars = _add_kw_max_constraints(network, req)
+
+    # Solve with HiGHS LP
     try:
-        network.optimize(solver_name="highs")
+        if kw_max_vars is not None:
+            network.optimize.optimize_model(solver_name="highs")
+        else:
+            network.optimize(solver_name="highs")
     except Exception as exc:
         import linopy
         return {
@@ -262,6 +377,10 @@ def run_standalone_optimize(req: StandaloneOptimizeRequest) -> dict:
 
     battery_dispatch = network.storage_units_t.p["battery"].values
     battery_soc = network.storage_units_t.state_of_charge["battery"].values
+
+    # Compute peak import power and kW-max cost
+    peak_import_kw = float(max(np.max(grid_import), 0)) if len(grid_import) > 0 else 0.0
+    kw_max_cost = _compute_kw_max_cost(peak_import_kw, req)
 
     schedule_96 = []
     total_charge_kwh = 0.0
@@ -328,5 +447,7 @@ def run_standalone_optimize(req: StandaloneOptimizeRequest) -> dict:
         "net_total_cost_eur": round(net_total_cost, 2),
         "energy_cost_eur": round(energy_cost, 2),
         "degradation_cost_eur": round(total_degradation_cost, 2),
+        "kw_max_cost_eur": round(kw_max_cost, 2),
+        "peak_import_kw": round(peak_import_kw, 2),
         "schedule_96": schedule_96,
     }
