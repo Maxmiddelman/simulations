@@ -193,29 +193,6 @@ def _build_pypsa_network(req: StandaloneOptimizeRequest):
         marginal_cost=degradation_marginal,
     )
 
-    # --- SOC target constraint ---
-    # If target_soc_kwh is set, add a constraint that the final SOC must
-    # be >= target (shifted into usable-band coordinates).
-    if req.target_soc_kwh is not None:
-        shifted_target = max(0, req.target_soc_kwh - min_soc)
-        if use_cyclic:
-            # With cyclic=True, PyPSA enforces soc[-1] == soc[0] automatically.
-            # We set state_of_charge_initial to the shifted target so the
-            # battery starts and ends at the target.
-            network.storage_units.loc["battery", "state_of_charge_initial"] = shifted_target
-        else:
-            # Without cyclic, add an explicit constraint on the last snapshot.
-            try:
-                model = network.optimize.create_model(solver_name="highs")
-                soc = model.variables["StorageUnit-state_of_charge"]
-                last_snapshot = network.snapshots[-1]
-                model.add_constraints(
-                    soc.loc[last_snapshot, "battery"] >= shifted_target,
-                    name="soc_target_final",
-                )
-            except Exception:
-                pass  # Fallback: if custom constraint fails, proceed without it
-
     return network, min_soc, max_soc, usable_band
 
 def _compute_kw_max_cost(peak_import_kw: float, req: StandaloneOptimizeRequest) -> float:
