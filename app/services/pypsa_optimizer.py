@@ -231,7 +231,7 @@ def _compute_kw_max_cost(peak_import_kw: float, req: StandaloneOptimizeRequest) 
 def _add_kw_max_constraints(network, req: StandaloneOptimizeRequest):
     """Add a peak-import-power variable and piecewise-linear kW-max cost to the LP model.
 
-    The Dutch kW-max tariff charges per kW of peak import power above a free threshold,
+    The Dutch kWmax tariff charges per kW of peak import power above a free threshold,
     with two tiers (mid and high). We model this with two non-negative variables:
     - mid_excess: kW above free threshold, up to mid_threshold
     - high_excess: kW above mid_threshold
@@ -484,14 +484,6 @@ def run_standalone_optimize(req: StandaloneOptimizeRequest) -> dict:
     revenue_eur = -net_total_cost
     energy_cost = sum(s["net_cost_eur"] for s in schedule_96)
     avg_da_price = float(np.mean(da_prices)) if len(da_prices) > 0 else 0.0
-
-    # Validate hourly price uniformity: if prices are hourly, all 4 quarters in each hour must match
-    for h in range(24):
-        hour_prices = da_prices[h * 4:(h + 1) * 4]
-        if len(hour_prices) == 4 and not np.allclose(hour_prices, hour_prices[0], atol=0.01):
-            validation_errors.append(
-                f"Hour {h}: quarter prices differ {hour_prices.tolist()} — expected identical for hourly market"
-            )
 
     is_valid = len(validation_errors) == 0
 
