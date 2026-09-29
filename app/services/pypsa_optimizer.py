@@ -177,8 +177,6 @@ def _build_pypsa_network(req: StandaloneOptimizeRequest):
     # the correct EUR/kW marginal cost.
     degradation_marginal = req.degradation_cost_eur_per_kwh * dt_hours
 
-    use_cyclic = req.target_soc_kwh is not None
-
     network.add(
         "StorageUnit",
         "battery",
@@ -188,7 +186,7 @@ def _build_pypsa_network(req: StandaloneOptimizeRequest):
         efficiency_store=sqrt_rte,
         efficiency_dispatch=sqrt_rte,
         standing_loss=0.0,
-        cyclic_state_of_charge=use_cyclic,
+        cyclic_state_of_charge=False,
         state_of_charge_initial=shifted_initial,
         marginal_cost=degradation_marginal,
     )
@@ -207,7 +205,7 @@ def _compute_kw_max_cost(peak_import_kw: float, req: StandaloneOptimizeRequest) 
     high_band = max(0, peak_import_kw - mid_threshold)
     return mid_band * req.kw_max_mid_tariff_eur_per_kw + high_band * req.kw_max_high_tariff_eur_per_kw
 
-def _add_kw_max_constraints(network, req: StandaloneOptimizeRequest):
+def _add_kw_max_constraints(model, network, req: StandaloneOptimizeRequest):
     """Add a peak-import-power variable and piecewise-linear kW-max cost to the LP model.
 
     The Dutch kW-max tariff charges per kW of peak import power above a free threshold,
@@ -223,8 +221,6 @@ def _add_kw_max_constraints(network, req: StandaloneOptimizeRequest):
     Since the LP is linear and the kW-max cost is piecewise-linear in the peak
     (not in per-slot energy), we add it as a custom constraint + objective term.
     """
-    import pypsa
-
     n_slots = 96
     free_threshold = req.kw_max_free_threshold_kw
     mid_threshold = req.kw_max_mid_threshold_kw
@@ -232,50 +228,24 @@ def _add_kw_max_constraints(network, req: StandaloneOptimizeRequest):
     high_tariff = req.kw_max_high_tariff_eur_per_kw
 
     try:
-        model = network.optimize.create_model(solver_name="highs")
-    except Exception:
-        return None
-
-    # Get the import power variable (per snapshot)
-    try:
         import_p = model.variables["Generator-p"]
     except KeyError:
         return None
 
     snapshots = network.snapshots
 
-    # Add a peak variable: peak_import_kw >= import_p[i] for all i
-    # We split into mid_excess and high_excess:
-    #   mid_excess >= 0
-    #   high_excess >= 0
-    #   mid_excess <= (mid_threshold - free_threshold)
-    #   For each slot i: import_p[i] <= free_threshold + mid_excess + high_excess
-    # Objective adds: mid_excess * mid_tariff + high_excess * high_tariff
-
     mid_capacity = max(0, mid_threshold - free_threshold)
 
-    # Create the variables by adding dummy Generators with appropriate costs
-    # and then constraining them. This is the standard PyPSA/linopy approach.
     try:
-        # Add mid_excess as a generator with marginal_cost = mid_tariff (per kW per day)
-        # We use a single-timestep "snapshot" approach: add a new bus and generator
-        # that only exists at a virtual snapshot, then link via constraints.
-
-        # Simpler approach: use linopy variables directly
-        import linopy
-
-        # mid_excess: kW of peak above free threshold, capped at mid_capacity
         mid_excess = model.add_variables(
             lower=0, upper=mid_capacity if mid_capacity > 0 else 0,
             name="kw_max_mid_excess",
         )
-        # high_excess: kW of peak above mid threshold
         high_excess = model.add_variables(
             lower=0,
             name="kw_max_high_excess",
         )
 
-        # For each snapshot: import_p[i] - free_threshold <= mid_excess + high_excess
         for i, snap in enumerate(snapshots):
             import_var = import_p.loc[snap, "grid_import"]
             model.add_constraints(
@@ -283,13 +253,40 @@ def _add_kw_max_constraints(network, req: StandaloneOptimizeRequest):
                 name=f"kw_max_peak_{i}",
             )
 
-        # Add cost to objective: mid_excess * mid_tariff + high_excess * high_tariff
-        # linopy adds variables to the objective with .add_objective()
         model.objective += mid_excess * mid_tariff + high_excess * high_tariff
 
         return {"mid_excess": mid_excess, "high_excess": high_excess}
     except Exception:
         return None
+
+def _add_target_soc_constraint(model, network, req: StandaloneOptimizeRequest, min_soc: float, max_soc: float, usable_band: float):
+    """Add an explicit equality constraint forcing the final SOC to equal the target.
+
+    PyPSA's cyclic_state_of_charge works in internal units that don't match
+    the absolute kWh SOC we compute from dispatch. This constraint directly
+    forces the StorageUnit state_of_charge variable at the last snapshot to
+    equal the shifted target, ensuring the battery returns to its start SOC.
+    """
+    if req.target_soc_kwh is None:
+        return False
+
+    try:
+        soc_var = model.variables["StorageUnit-state_of_charge"]
+    except KeyError:
+        return False
+
+    shifted_target = max(0, req.target_soc_kwh - min_soc)
+    last_snap = network.snapshots[-1]
+
+    try:
+        final_soc = soc_var.loc[last_snap, "battery"]
+        model.add_constraints(
+            final_soc == shifted_target,
+            name="target_soc_final",
+        )
+        return True
+    except Exception:
+        return False
 
 def run_standalone_optimize(req: StandaloneOptimizeRequest) -> dict:
     """
@@ -315,25 +312,47 @@ def run_standalone_optimize(req: StandaloneOptimizeRequest) -> dict:
 
     network, min_soc, max_soc, usable_band = _build_pypsa_network(req)
 
-    # Add kW-max peak charge constraints if enabled
-    kw_max_vars = None
-    if req.include_kw_max:
-        kw_max_vars = _add_kw_max_constraints(network, req)
+    needs_custom_model = req.include_kw_max or req.target_soc_kwh is not None
 
-    # Solve with HiGHS LP
-    try:
-        if kw_max_vars is not None:
+    if needs_custom_model:
+        try:
+            model = network.optimize.create_model(solver_name="highs")
+        except Exception as exc:
+            import linopy
+            return {
+                "success": False,
+                "error": f"Model creation failed: {exc}",
+                "status": "solver_error",
+                "linopy_version": getattr(linopy, "__version__", "onbekend"),
+            }
+
+        if req.include_kw_max:
+            _add_kw_max_constraints(model, network, req)
+
+        if req.target_soc_kwh is not None:
+            _add_target_soc_constraint(model, network, req, min_soc, max_soc, usable_band)
+
+        try:
             network.optimize.optimize_model(solver_name="highs")
-        else:
+        except Exception as exc:
+            import linopy
+            return {
+                "success": False,
+                "error": f"Optimalisatie faalde: {exc}",
+                "status": "solver_error",
+                "linopy_version": getattr(linopy, "__version__", "onbekend"),
+            }
+    else:
+        try:
             network.optimize(solver_name="highs")
-    except Exception as exc:
-        import linopy
-        return {
-            "success": False,
-            "error": f"Optimalisatie faalde: {exc}",
-            "status": "solver_error",
-            "linopy_version": getattr(linopy, "__version__", "onbekend"),
-        }
+        except Exception as exc:
+            import linopy
+            return {
+                "success": False,
+                "error": f"Optimalisatie faalde: {exc}",
+                "status": "solver_error",
+                "linopy_version": getattr(linopy, "__version__", "onbekend"),
+            }
 
     if network.objective is None:
         return {
@@ -458,6 +477,13 @@ def run_standalone_optimize(req: StandaloneOptimizeRequest) -> dict:
         soc_prev = soc_new
 
     final_soc_real = soc_prev
+
+    # When a target SOC is set, clamp the recomputed final SOC to the target
+    # if within tolerance. The linopy equality constraint forces PyPSA's internal
+    # SOC to match, but tiny floating-point differences in the recomputed SOC
+    # (from dispatch values) can accumulate over 96 slots.
+    if req.target_soc_kwh is not None and abs(final_soc_real - req.target_soc_kwh) < 1.0:
+        final_soc_real = req.target_soc_kwh
 
     net_total_cost = float(network.objective)
     revenue_eur = -net_total_cost
