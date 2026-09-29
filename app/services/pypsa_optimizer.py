@@ -23,6 +23,7 @@ class StandaloneOptimizeRequest(BaseModel):
     da_price_eur_per_mwh_96: list[float]
     id_price_eur_per_mwh_96: Optional[list[float]] = None
     initial_soc_kwh: float
+    start_hour: int = 0
     battery_power_kw: float
     battery_capacity_kwh: float
     dod: float = 0.9
@@ -88,8 +89,9 @@ def _build_pypsa_network(req: StandaloneOptimizeRequest):
     max_soc = req.battery_capacity_kwh * (max_pct / 100)
     usable_band = max(0.001, max_soc - min_soc)
 
+    start_ts = pd.Timestamp(f"{req.date}T00:00:00") + pd.Timedelta(hours=req.start_hour)
     snapshots = pd.date_range(
-        start=f"{req.date}T00:00:00", periods=n_slots, freq="15min"
+        start=start_ts, periods=n_slots, freq="15min"
     )
 
     network = pypsa.Network()
@@ -169,11 +171,11 @@ def _build_pypsa_network(req: StandaloneOptimizeRequest):
 
     shifted_initial = max(0, req.initial_soc_kwh - min_soc)
 
-    # Degradation cost: add as marginal_cost on the storage unit so the LP
-    # naturally penalizes throughput instead of post-processing.
-    # PyPSA applies marginal_cost to dispatch power (kW), so per-kWh cost
-    # is degradation_cost / dt_hours to get EUR/kW equivalent.
-    degradation_marginal = req.degradation_cost_eur_per_kwh / dt_hours
+    # Degradation cost: marginal_cost on the storage unit penalizes throughput.
+    # PyPSA applies marginal_cost to dispatch power (kW). Since each slot is
+    # dt_hours long, energy per kW = dt_hours kWh, so EUR/kWh * dt_hours gives
+    # the correct EUR/kW marginal cost.
+    degradation_marginal = req.degradation_cost_eur_per_kwh * dt_hours
 
     use_cyclic = req.target_soc_kwh is not None
 
@@ -231,7 +233,7 @@ def _compute_kw_max_cost(peak_import_kw: float, req: StandaloneOptimizeRequest) 
 def _add_kw_max_constraints(network, req: StandaloneOptimizeRequest):
     """Add a peak-import-power variable and piecewise-linear kW-max cost to the LP model.
 
-    The Dutch kWmax tariff charges per kW of peak import power above a free threshold,
+    The Dutch kW-max tariff charges per kW of peak import power above a free threshold,
     with two tiers (mid and high). We model this with two non-negative variables:
     - mid_excess: kW above free threshold, up to mid_threshold
     - high_excess: kW above mid_threshold
