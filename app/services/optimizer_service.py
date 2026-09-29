@@ -292,6 +292,9 @@ def _save_optimization(site_id: str, battery_schedule: np.ndarray, net_load: np.
         grid_kw = _safe_float(net_load[i] - battery_schedule[i])
         price = _safe_float(prices[i]) if i < len(prices) else 0.0
 
+        if price <= 0:
+            continue
+
         rows.append({
             "site_id": site_id,
             "ts_utc": ts.isoformat(),
@@ -299,6 +302,10 @@ def _save_optimization(site_id: str, battery_schedule: np.ndarray, net_load: np.
             "grid_kw": grid_kw,
             "price_eur_mwh": price,
         })
+
+    if not rows:
+        print(f"optimizer_results_15m upsert skipped: no rows with valid prices for {site_id}")
+        return False
 
     def _upsert(client):
         return (
@@ -403,6 +410,9 @@ def _commit_day_ahead_profile(
         load_kw = _safe_float(net_load[i] + pv_forecast[i]) if i < len(pv_forecast) else 0.0
         pv_kw = _safe_float(pv_forecast[i]) if i < len(pv_forecast) else 0.0
         soc_kwh = _safe_float(soc_trajectory[i]) if i < len(soc_trajectory) else 0.0
+
+        if price <= 0:
+            continue
 
         rows.append({
             "site_id": site_id,
