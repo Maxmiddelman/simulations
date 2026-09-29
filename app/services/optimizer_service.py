@@ -2,7 +2,10 @@ import math
 import logging
 import numpy as np
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from app.db import get_supabase, supabase as _default_client
+
+_AMSTERDAM = ZoneInfo("Europe/Amsterdam")
 
 logger = logging.getLogger("enersim-api.optimizer")
 
@@ -58,13 +61,17 @@ def _fetch_forecast(site_id: str) -> list[dict]:
     return result.data or []
 
 def _fetch_da_prices(start: datetime, end: datetime) -> list[dict]:
+    start_date = start.astimezone(_AMSTERDAM).date().isoformat()
+    end_date = end.astimezone(_AMSTERDAM).date().isoformat()
+
     def _query(client):
         return (
-            client.table("day_ahead_prices")
-            .select("timestamp, price_eur_mwh")
-            .gte("timestamp", start.isoformat())
-            .lte("timestamp", end.isoformat())
-            .order("timestamp")
+            client.table("flex_trading_algo")
+            .select("datum, isp_nummer, da_prijs")
+            .gte("datum", start_date)
+            .lte("datum", end_date)
+            .order("datum")
+            .order("isp_nummer")
             .execute()
         )
 
@@ -208,9 +215,6 @@ def _optimize_battery_schedule(
         price_spread = np.max(prices) - np.min(prices)
         if price_spread > 20:
             median_price = np.median(prices)
-            # Continue from the actual SOC after peak shaving
-            # FIX: use soc_kwh directly instead of a separate variable,
-            # so Phases 3/4/5 see the correct post-arbitrage SOC.
             for i in range(n_slots):
                 current_schedule = battery_schedule[i]
                 remaining_power = battery_power_kw - abs(current_schedule)
@@ -236,6 +240,7 @@ def _optimize_battery_schedule(
             grid_after_battery = net_load[i] - battery_schedule[i]
             if grid_after_battery > grid_import_limit_kw:
                 extra_discharge = grid_after_battery - grid_import_limit_kw
+                # Only discharge if battery has energy above min SOC
                 max_discharge_from_soc = (soc_kwh - min_soc) / dt_hours if soc_kwh > min_soc else 0
                 actual_extra = min(extra_discharge, battery_power_kw - battery_schedule[i], max_discharge_from_soc)
                 if actual_extra > 0:
@@ -243,6 +248,8 @@ def _optimize_battery_schedule(
                     soc_kwh -= actual_extra * dt_hours
 
     # Phase 4: Enforce grid export limit (negative grid = export)
+    # If export exceeds the limit, charge the battery to absorb the surplus
+    # instead of curtailing PV.
     if grid_export_limit_kw > 0:
         for i in range(n_slots):
             grid_after_battery = net_load[i] - battery_schedule[i]
@@ -255,6 +262,9 @@ def _optimize_battery_schedule(
                     soc_kwh += extra_charge * dt_hours * battery_rte
 
     # Phase 5: Final feasibility safety-net
+    # Walk through the schedule one more time and clamp any battery action
+    # that would violate SOC limits, ensuring all prior phases produce a
+    # physically realizable schedule.
     soc_kwh_final = soc_kwh
     for i in range(n_slots):
         kw = battery_schedule[i]
@@ -301,7 +311,7 @@ def _save_optimization(site_id: str, battery_schedule: np.ndarray, net_load: np.
         _with_retry(_upsert)
         return True
     except Exception as e:
-        logger.warning("optimizer_results_15m upsert skipped: %s", e)
+        print(f"optimizer_results_15m upsert skipped: {e}")
         return False
 
 def _compute_soc_trajectory(
@@ -355,8 +365,13 @@ def _commit_day_ahead_profile(
 ) -> dict:
     """
     Commit the finalized Day-Ahead profile to committed_day_ahead_profiles.
+
     This is the LOCK mechanism: once committed, the profile is immutable.
+    If a committed profile already exists for this (site_id, target_date),
+    the existing baseline is preserved -- it is NOT overwritten.
+    A new profile_version is only created if no committed rows exist yet.
     """
+
     def _check_existing(client):
         return (
             client.table("committed_day_ahead_profiles")
@@ -376,7 +391,7 @@ def _commit_day_ahead_profile(
                 "message": f"Day-Ahead profile for {target_date} already committed and locked",
             }
     except Exception as e:
-        logger.warning("committed_day_ahead_profiles check failed: %s", e)
+        print(f"committed_day_ahead_profiles check failed: {e}")
         return {"committed": False, "reason": "check_failed", "message": str(e)}
 
     rows = []
@@ -419,7 +434,7 @@ def _commit_day_ahead_profile(
             "profile_version": 1,
         }
     except Exception as e:
-        logger.warning("committed_day_ahead_profiles insert failed: %s", e)
+        print(f"committed_day_ahead_profiles insert failed: {e}")
         return {"committed": False, "reason": "insert_failed", "message": str(e)}
 
 def run_optimizer_for_site(site_id: str, target_date: str | None = None):
@@ -455,16 +470,17 @@ def run_optimizer_for_site(site_id: str, target_date: str | None = None):
 
     prices = np.zeros(len(net_load))
     if price_rows:
+        price_map: dict[str, float] = {}
         for pr in price_rows:
-            try:
-                ts = datetime.fromisoformat(pr["timestamp"].replace("Z", "+00:00"))
-                hour_offset = int((ts - start).total_seconds() / 3600)
-                for q in range(4):
-                    idx = hour_offset * 4 + q
-                    if 0 <= idx < len(prices):
-                        prices[idx] = _safe_float(pr.get("price_eur_mwh", 0))
-            except (ValueError, KeyError):
-                continue
+            price_map[f"{pr['datum']}_{pr['isp_nummer']}"] = _safe_float(pr.get("da_prijs", 0))
+        for i in range(len(prices)):
+            slot_time = start + timedelta(minutes=15 * i)
+            local = slot_time.astimezone(_AMSTERDAM)
+            slot_date = local.date().isoformat()
+            isp_num = local.hour * 4 + local.minute // 15 + 1
+            key = f"{slot_date}_{isp_num}"
+            if key in price_map:
+                prices[i] = price_map[key]
 
     battery_rte = config.get("battery_rte", 0.9)
     battery_dod = config.get("battery_dod", 0.9)
